@@ -264,7 +264,7 @@ A two-model ensemble combining a fine-tuned code classifier and Gemini LLM analy
 
 ### LLM Detector (Gemini)
 
-- **Model**: Configured via `GEMINI_MODEL` env var (default `gemini-2.5-flash`)
+- **Model**: Configured via `GEMINI_MODEL` env var (default `gemini-3.1-flash-lite-preview`)
 - **Output**: `SAFE`/`BUG` + severity (`CRITICAL` / `HIGH` / `MEDIUM` / `LOW` / `NONE`) + reason
 - **Retries**: 3 attempts with exponential back-off (1.5 s, 3 s, 4.5 s)
 - **Fallback**: Returns `SAFE` / `NONE` if all retries fail
@@ -527,7 +527,7 @@ NEO4J_PASSWORD=your_password_here
 GOOGLE_APPLICATION_CREDENTIALS=./gcp-credentials.json
 GCP_PROJECT_ID=your_gcp_project_id
 GCP_LOCATION=global                    # Vertex AI location
-GEMINI_MODEL=gemini-2.5-flash          # or gemini-2.5-flash-lite-preview
+GEMINI_MODEL=gemini-3.1-flash-lite-preview          # or gemini-3.1-flash-lite-preview-lite-preview
 
 # ── HuggingFace (optional overrides) ──────────────
 # GRAPHCODEBERT_C_MODEL_ID=2451-22-749-016/graphcodebert-c-bug-detector
@@ -685,7 +685,7 @@ gcloud run deploy codebase-agent `
   --set-env-vars="GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp-credentials.json" `
   --set-env-vars="GCP_PROJECT_ID=YOUR_PROJECT_ID" `
   --set-env-vars="GCP_LOCATION=global" `
-  --set-env-vars="GEMINI_MODEL=gemini-2.5-flash" `
+  --set-env-vars="GEMINI_MODEL=gemini-3.1-flash-lite-preview" `
   --set-env-vars="NEO4J_URI=neo4j+s://YOUR_AURA_ID.databases.neo4j.io" `
   --set-env-vars="NEO4J_USER=YOUR_USER" `
   --set-env-vars="NEO4J_PASSWORD=YOUR_PASSWORD" `
@@ -741,4 +741,4 @@ Ensure the image was built with the model pre-download step (added to the Docker
 
 ### Gemini model not found
 
-Verify `GEMINI_MODEL` is a valid model ID available in your GCP project and region. Use `gemini-2.5-flash` as a reliable default.
+Verify `GEMINI_MODEL` is a valid model ID available in your GCP project and region. Use `gemini-3.1-flash-lite-preview` as a reliable default.
