@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .dockerignore — controls what the Docker build context sends to the daemon
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Python virtualenv and caches (never needed in image)
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node build artifacts (Stage 1 re-installs deps from package-lock.json)
+node_modules/
+dist/
+
+# Git history
+.git/
+.gitignore
+
+# Secrets — NEVER bake into the image; inject at runtime via docker-compose
+.env
+gcp-credentials.json
+
+# ML model files — downloaded from HuggingFace Hub at first container startup
+# and cached in the hf_model_cache Docker volume. Excluded to keep image lean.
+models/
+
+# Chat session persistence file — written at runtime inside the container
+.chat_sessions.json
+
+# Dev / editor artefacts
+skills-lock.json
+*.json.report
+htmlcov/
+README.md
+.claude/
+
+# Test fixtures (not needed at runtime)
+graph_rag/test_repo/
+graph_rag/test_suite/

@@ -1,0 +1,33 @@
+# Use PyTorch CPU-only builds (no GPU on Cloud Run; saves ~600MB of CUDA packages)
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# ML / AI
+torch
+transformers
+numpy
+google-genai
+
+# Graph / Neo4j
+neo4j
+
+# Parsing — tree-sitter-languages bundles all pre-compiled grammars (C, C++, Java, Python, etc.)
+# Pinned to the exact version used in development — prevents wheel version drift in Docker
+# that can cause silent parse failures (all files [skip]ped → 0 nodes inserted)
+tree-sitter-languages==1.10.2
+# tree-sitter-languages==1.10.2 was built against tree-sitter<0.22.
+# In tree-sitter 0.22+, Language() changed from 2-arg to 1-arg constructor,
+# breaking get_language()/get_parser() with "__init__() takes exactly 1 argument".
+# This is the EXACT failure that caused 0 nodes on the old Cloud Run deployment.
+tree-sitter>=0.21.0,<0.22
+
+# Embeddings & semantic search
+sentence-transformers
+
+# API server
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+aiofiles
+
+# Config
+python-dotenv

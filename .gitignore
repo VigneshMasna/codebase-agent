@@ -1,0 +1,36 @@
+# ── Secrets — NEVER commit these ──────────────────────────────────────────────
+.env
+gcp-credentials.json
+
+# ── Python ─────────────────────────────────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+htmlcov/
+.coverage
+
+# ── Node ───────────────────────────────────────────────────────────────────────
+node_modules/
+dist/
+
+# ── ML model files (downloaded from HuggingFace at runtime) ───────────────────
+models/
+
+# ── Runtime / generated files ─────────────────────────────────────────────────
+.chat_sessions.json
+*.json.report
+
+# ── Editor / OS junk ───────────────────────────────────────────────────────────
+.claude/
+skills-lock.json
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+~$*

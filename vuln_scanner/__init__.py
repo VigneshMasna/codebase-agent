@@ -1,0 +1,2 @@
+"""CLI vulnerability scanner package."""
+
