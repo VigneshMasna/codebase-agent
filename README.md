@@ -1,56 +1,84 @@
 # Codebase Agent
 
-An AI-powered source code analysis platform that combines graph-based code representation, vulnerability detection, and conversational analysis. The system extracts complete software architecture from source code into a Neo4j knowledge graph, detects security vulnerabilities using a GraphCodeBERT + Gemini hybrid, and enables engineers to ask natural-language questions about their codebase through a ReAct agent.
+An AI-powered source code analysis platform that transforms raw C, C++, and Java codebases into a queryable knowledge graph — with built-in vulnerability detection and a conversational AI agent for natural-language code exploration.
+
+**What it does end-to-end:**
+1. Accept a `.zip` upload or folder path containing C / C++ / Java source files
+2. Parse every file with Tree-Sitter, extract the full symbol graph (functions, classes, structs, call chains, inheritance)
+3. Enrich each node with semantic summaries, architectural tags, and graph metrics using Gemini
+4. Detect security vulnerabilities with a GraphCodeBERT + Gemini hybrid scanner
+5. Store everything in a Neo4j knowledge graph
+6. Let engineers explore the codebase through a Gemini ReAct agent with 8 graph-query tools, an interactive force-directed graph, and a vulnerability dashboard
 
 ---
 
 ## Table of Contents
 
-- [Architecture Overview](#architecture-overview)
+- [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Tech Stack](#tech-stack)
-- [Module Reference](#module-reference)
-  - [api/](#api)
-  - [graph\_rag/](#graph_rag)
-  - [vuln\_scanner/](#vuln_scanner)
-  - [models/](#models)
-- [Data Flow](#data-flow)
-  - [Ingest Pipeline](#ingest-pipeline)
-  - [Chat / Agent Flow](#chat--agent-flow)
-  - [Scan Flow](#scan-flow)
+- [Ingestion Pipeline](#ingestion-pipeline)
+- [Vulnerability Scanner](#vulnerability-scanner)
+- [Chat Agent](#chat-agent)
+- [Neo4j Graph Schema](#neo4j-graph-schema)
 - [API Reference](#api-reference)
+- [Frontend](#frontend)
 - [Configuration](#configuration)
-- [Installation](#installation)
-- [Running the System](#running-the-system)
+- [Local Development](#local-development)
+- [Docker Deployment](#docker-deployment)
+- [Cloud Run Deployment](#cloud-run-deployment)
 - [Common Issues](#common-issues)
 
 ---
 
-## Architecture Overview
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        FastAPI Server                           │
-│  /scan   /ingest   /chat   /api   /health                       │
-└────────────┬────────────────────────────────────────────────────┘
-             │
-    ┌────────▼────────────────────────────────────┐
-    │            INGESTION PIPELINE               │
-    │  File Discovery → AST Extraction            │
-    │  → Call/Inheritance Resolution              │
-    │  → Metrics → Gemini Enrichment              │
-    │  → Similarity Edges → Bug Annotation        │
-    └────────┬────────────────────────────────────┘
-             │
-    ┌────────▼──────────────┐    ┌─────────────────────────┐
-    │   Neo4j Knowledge     │◄───│   GraphCodeBERT + LLM   │
-    │      Graph            │    │   Vulnerability Scanner  │
-    └────────┬──────────────┘    └─────────────────────────┘
-             │
-    ┌────────▼──────────────┐
-    │   Gemini ReAct Agent  │
-    │   (8 graph tools)     │
-    └───────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  Source Code  ─── C · C++ · Java                                     │
+└───────────────────────────┬──────────────────────────────────────────┘
+                            │  ZIP upload or folder path
+                            ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│                       Ingestion Pipeline                              │
+│                                                                      │
+│  Tree-Sitter Parser (AST)                                            │
+│       │                                                              │
+│  Symbol Extractor  ──  Function · Class · Struct · Interface         │
+│       │                                                              │
+│  Call & Inheritance Resolver  ──  CALLS · INHERITS_FROM · IMPLEMENTS │
+│       │                                                              │
+│  Metrics Computer  ──  fan_in · fan_out · impact_score               │
+│       │                                                              │
+│  Gemini Enrichment  ──  summary · tags · layer                       │
+│       │                                                              │
+│  Embedding Generator  ──  all-MiniLM-L6-v2 · 384-dim                │
+│       │                                                              │
+│  Similarity Enricher  ──  SIMILAR_TO edges (cosine ≥ 0.85)          │
+└───────────────────────────┬──────────────────────────────────────────┘
+                            │                        │
+              Enriched CodeGraph          Function Bodies
+                            │                        │
+                            ▼                        ▼
+              ┌─────────────────────┐   ┌────────────────────────────┐
+              │  Neo4j Knowledge    │   │  Vulnerability Detection    │
+              │      Graph          │   │                            │
+              │                     │   │  GraphCodeBERT             │
+              │  Cypher Queries ◄───┼───┤  + Juliet + CodeXGLUE      │
+              └─────────┬───────────┘   └────────────────────────────┘
+                        │                        │
+              is_buggy · severity · confidence   │
+                        │                        │
+                        ▼
+              ┌─────────────────────────────────────────────────┐
+              │           GraphRAG ReAct Agent                   │
+              │                                                  │
+              │  Gemini ReAct Agent                              │
+              │  8 Graph Query Tools:                            │
+              │    nCypher · Trace · Impact · Search             │
+              │                                                  │
+              │  Natural Language Query ──► Structured Response  │
+              └─────────────────────────────────────────────────┘
 ```
 
 ---
@@ -59,795 +87,658 @@ An AI-powered source code analysis platform that combines graph-based code repre
 
 ```
 codebase-agent/
-├── api/                        # FastAPI REST server
-│   ├── main.py                 # App factory, lifespan, middleware
-│   ├── run.py                  # uvicorn entry point + CLI config
-│   ├── config.py               # Resource initialization (Neo4j, scanner, agent)
-│   ├── dependencies.py         # Dependency injection for 503 graceful degradation
+├── api/                            # FastAPI REST server
+│   ├── main.py                     # App factory, lifespan, CORS, SPA catch-all
+│   ├── run.py                      # Uvicorn entry point + CLI args
+│   ├── config.py                   # Singleton resource init: Neo4j, scanner, agent
+│   ├── dependencies.py             # DI: graceful 503 degradation per resource
 │   ├── models/
-│   │   ├── requests.py         # Pydantic request models
-│   │   └── responses.py        # Pydantic response models
+│   │   ├── requests.py             # Pydantic request bodies
+│   │   └── responses.py            # Pydantic response bodies
 │   ├── routes/
-│   │   ├── scan.py             # POST /scan/* — code/file/folder/upload scanning
-│   │   ├── ingest.py           # POST /ingest/* — folder/zip ingestion + SSE progress
-│   │   ├── chat.py             # POST /chat/* — single-turn, stream, session management
-│   │   └── graph.py            # GET /api/* — graph data, scan results, stats
+│   │   ├── scan.py                 # POST /scan/{code,file,folder,upload}
+│   │   ├── ingest.py               # POST /ingest, /ingest/upload; GET progress/status/jobs
+│   │   ├── chat.py                 # POST /chat, /chat/stream; GET/DELETE sessions
+│   │   └── graph.py                # GET /api/graph, /api/scan-results, /api/stats, /api/node/{uid}
 │   └── services/
-│       ├── ingest_service.py   # Orchestrates the 10-step extraction pipeline
-│       └── graph_service.py    # Queries Neo4j for frontend visualization
+│       ├── ingest_service.py       # 10-step ingestion pipeline orchestrator
+│       └── graph_service.py        # Neo4j → frontend visualization queries
 │
-├── graph_rag/                  # Graph-RAG extraction + agent core
+├── graph_rag/                      # Graph extraction + RAG agent core
 │   ├── agent/
-│   │   ├── codebase_agent.py   # Gemini ReAct agent (function-calling loop, max 12 turns)
-│   │   ├── tools.py            # 8 graph query tools
-│   │   ├── tool_registry.py    # Converts tools to Gemini FunctionDeclarations
-│   │   └── context_builder.py  # Builds graph overview for agent system prompt
+│   │   ├── codebase_agent.py       # Gemini ReAct agent (function-calling loop, max 12 turns)
+│   │   ├── tools.py                # 8 graph query tool implementations
+│   │   ├── tool_registry.py        # Tools → Gemini FunctionDeclaration schema
+│   │   └── context_builder.py      # Graph overview injected into system prompt
 │   ├── embedding/
-│   │   └── embedding_generator.py  # SentenceTransformer all-MiniLM-L6-v2
+│   │   └── embedding_generator.py  # SentenceTransformer all-MiniLM-L6-v2 (384-dim)
 │   ├── enrichment/
-│   │   ├── metrics_computer.py     # fan_in, fan_out, impact_score, entry points
+│   │   ├── metrics_computer.py     # fan_in, fan_out, impact_score, entry_points, is_leaf
 │   │   ├── summary_enricher.py     # Gemini: summary, core_functionality, tags, layer
-│   │   ├── similarity_enricher.py  # SIMILAR_TO edges via cosine similarity
-│   │   └── bug_annotator.py        # Runs scanner + writes is_buggy/severity to Neo4j
+│   │   ├── similarity_enricher.py  # SIMILAR_TO edges (cosine ≥ 0.85, top-5 per node)
+│   │   └── bug_annotator.py        # Scanner → writes is_buggy/severity/confidence to Neo4j
 │   ├── extraction/
-│   │   ├── symbol_models.py        # Node, Edge, CodeGraph, UnresolvedCall models
-│   │   ├── symbol_index.py         # Global name → UID index
-│   │   ├── symbol_extractor.py     # Language router to per-language extractors
+│   │   ├── symbol_models.py        # Node, Edge, CodeGraph, UnresolvedCall data models
+│   │   ├── symbol_index.py         # Global name → UID lookup index (cross-file resolution)
+│   │   ├── symbol_extractor.py     # Language router → per-language extractors
 │   │   ├── java_extractor.py       # Classes, methods, inheritance from Java AST
 │   │   ├── c_extractor.py          # Functions, structs, typedefs from C AST
 │   │   ├── cpp_extractor.py        # Classes, namespaces, templates from C++ AST
 │   │   ├── call_resolver.py        # UnresolvedCall → CALLS edges via SymbolIndex
 │   │   └── inheritance_resolver.py # INHERITS_FROM, IMPLEMENTS edges
 │   ├── graph/
-│   │   ├── neo4j_client.py         # Neo4j driver wrapper (connect, query, constraints)
-│   │   └── neo4j_graph_builder.py  # Inserts nodes/edges; creates uniqueness constraints
+│   │   ├── neo4j_client.py         # Neo4j driver wrapper: connect, query, constraints
+│   │   └── neo4j_graph_builder.py  # Batch UNWIND insert nodes/edges; constraint creation
 │   ├── ingestion/
-│   │   └── repo_scanner.py         # Walks repo tree, discovers .c/.cpp/.h/.java files
-│   ├── parsing/
-│   │   └── treesitter_parser.py    # Tree-Sitter parser wrapper (C, C++, Java)
-│   ├── retrieval/
-│   │   └── hybrid_retriever.py     # Semantic + keyword retrieval (placeholder)
-│   ├── run_extraction.py           # Standalone extraction script for testing
-│   └── test_repo/                  # Sample codebase (Java + C++ files for testing)
-│       ├── AuthService.java
-│       ├── BaseService.java
-│       ├── User.java
-│       ├── auth_manager.cpp
-│       ├── db_connection.cpp
-│       ├── user_manager.cpp
-│       └── logger.cpp
+│   │   └── repo_scanner.py         # Walk repo tree, discover .c/.cpp/.h/.java files
+│   └── parsing/
+│       └── treesitter_parser.py    # Tree-Sitter bindings (C, C++, Java grammars)
 │
-├── vuln_scanner/               # Standalone vulnerability scanner
-│   ├── cli.py                  # CLI entry point (--folder/--file/--code)
+├── vuln_scanner/                   # Standalone vulnerability scanner
+│   ├── cli.py                      # CLI: --folder / --file / --code
 │   ├── core/
-│   │   ├── scanner.py          # CodeScanner: orchestrates extraction + detection + decision
-│   │   ├── models.py           # ScanResult dataclass
-│   │   ├── extraction.py       # Regex-based 2-phase function extraction
-│   │   └── language.py         # Language detection from file extensions
+│   │   ├── scanner.py              # CodeScanner: GraphCodeBERT + LLM + decision logic
+│   │   ├── models.py               # ScanResult dataclass
+│   │   ├── extraction.py           # Regex-based function extraction
+│   │   └── language.py             # Language detection from file extension
 │   ├── config/
-│   │   └── settings.py         # Settings dataclass (model paths, GCP, defaults)
+│   │   └── settings.py             # Model IDs, GCP config, env vars
 │   ├── detectors/
-│   │   ├── graphcodebert.py    # PyTorch-based GraphCodeBERT classifier
-│   │   └── llm.py              # Gemini semantic vulnerability analysis
+│   │   ├── graphcodebert.py        # Binary classifier: SAFE / BUG + confidence
+│   │   └── llm.py                  # Gemini: severity + reason (CRITICAL/HIGH/MEDIUM/LOW)
 │   └── reporting/
-│       ├── json_report.py      # Export results to JSON
-│       └── text.py             # Formatted text report to stdout
+│       ├── json_report.py          # Export scan results to JSON
+│       └── text.py                 # Formatted text report to stdout
 │
-├── models/                     # Pre-trained ML models (local storage)
-│   ├── graphcodebert_c_bug_detector/    # Hugging Face model for C vulnerability detection
-│   └── graphcodebert_java_bug_detector/ # Hugging Face model for Java vulnerability detection
+├── src/                            # React 19 frontend (Vite)
+│   ├── pages/
+│   │   ├── Dashboard.jsx           # Upload panel, graph visualisation, summary stats
+│   │   ├── ScanResults.jsx         # Vulnerability listing dashboard
+│   │   ├── GraphExplorer.jsx       # Interactive force-directed graph
+│   │   └── Chat.jsx                # Multi-turn streaming chat interface
+│   ├── components/                 # dashboard/, chat/, graph/, scan/, layout/, ui/
+│   ├── api/client.js               # Axios wrapper for all backend calls
+│   ├── context/IngestContext.jsx   # Global state: ingest jobs, SSE streams
+│   ├── hooks/                      # Custom React hooks
+│   └── store/                      # Zustand state: sessions, graph, UI
 │
-├── main.py                     # Root entry point → vuln_scanner.cli.run_cli()
-├── requirements.txt            # Python dependencies
-├── package.json                # Frontend dependencies (React, Tailwind, etc.)
-├── .env                        # Environment configuration (credentials, URIs, paths)
-├── .gitignore
-└── .chat_sessions.json         # Persisted chat session history (auto-managed)
+├── Dockerfile                      # Multi-stage: frontend build + Python backend
+├── docker-compose.yml              # Single-command local run
+├── requirements.txt                # Python dependencies
+├── package.json                    # Node.js dependencies
+├── .env.example                    # Environment variable template
+└── main.py                         # Root entry point → vuln_scanner CLI
 ```
 
 ---
 
 ## Tech Stack
 
-### Backend (Python)
+### Backend
+
+| Library | Version | Purpose |
+|---|---|---|
+| FastAPI | 0.111+ | REST API framework |
+| Uvicorn + UVLoop | 0.30+ | ASGI server |
+| Neo4j (official driver) | 5.x | Graph database client |
+| PyTorch (CPU) | 2.x | GraphCodeBERT model inference |
+| Transformers (HuggingFace) | 4.x | AutoTokenizer / AutoModel loading |
+| SentenceTransformers | 3.x | all-MiniLM-L6-v2 embeddings (384-dim) |
+| google-genai | latest | Gemini API via Vertex AI |
+| tree-sitter-languages | 1.10.2 | Pre-compiled AST parsers for C, C++, Java |
+| Pydantic v2 | 2.x | Request / response validation |
+| python-dotenv | — | `.env` loading |
+
+### Frontend
 
 | Library | Purpose |
 |---|---|
-| FastAPI 0.111+ | REST API framework |
-| uvicorn 0.30+ | ASGI server |
-| Neo4j (official driver) | Graph database client |
-| PyTorch + Transformers | GraphCodeBERT model inference |
-| google-genai | Gemini API for LLM enrichment, agent, and vulnerability analysis |
-| SentenceTransformers | all-MiniLM-L6-v2 embedding model (384-dim) |
-| tree-sitter + tree_sitter_languages | AST parsing for C, C++, Java |
-| python-dotenv | Environment variable loading |
-| Pydantic v2 | Request/response validation |
-
-### Frontend (Node.js)
-
-| Library | Purpose |
-|---|---|
-| React | UI framework |
-| React Router | Client-side routing |
+| React 19 + Vite | UI framework and build tool |
 | TailwindCSS | Utility-first CSS |
+| Zustand | Lightweight global state management |
 | Framer Motion | Animations |
 | Axios | HTTP client |
-| Zustand | Lightweight state management |
+| Neovis.js | Force-directed Neo4j graph visualisation |
 | Lucide React | Icon library |
 
 ### Infrastructure
 
 | Service | Purpose |
 |---|---|
-| Neo4j Aura (or self-hosted) | Graph database for code knowledge graph |
-| Google Vertex AI / Gemini | LLM for enrichment, agent reasoning, and vulnerability analysis |
-| GCP Service Account | Authentication for Gemini API |
+| Neo4j Aura (or self-hosted) | Knowledge graph storage |
+| Google Vertex AI / Gemini | LLM for enrichment, agent reasoning, vulnerability analysis |
+| GCP Service Account | Authentication for Vertex AI |
+| Docker + Cloud Run | Container build and production deployment |
 
 ---
 
-## Module Reference
+## Ingestion Pipeline
 
-### `api/`
+Triggered via `POST /ingest` (folder path) or `POST /ingest/upload` (ZIP file). Runs as a background task and streams live progress to the client via Server-Sent Events.
 
-The FastAPI server is the primary entry point for the full system. It initializes all resources at startup and exposes REST endpoints for scanning, ingestion, chat, and graph visualization.
+| Step | Name | What happens |
+|------|------|-------------|
+| 1 | **Connect to Neo4j** | Opens connection pool; optionally clears graph (`clear_first`); creates uniqueness constraints on all node labels |
+| 2 | **Load embedding model** | Loads `all-MiniLM-L6-v2` from cache (`HF_HOME`) or downloads it |
+| 3 | **Discover source files** | Walks the repo tree; filters `.java`, `.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp` |
+| 4 | **Extract AST symbols** | Tree-Sitter parses each file; extractors build `Function`, `Class`, `Struct`, `Enum`, `Interface`, `File`, `Import` nodes + structural edges |
+| 5 | **Resolve function calls** | `UnresolvedCall` records → `CALLS` edges using the global `SymbolIndex` |
+| 6 | **Resolve inheritance** | `INHERITS_FROM` (class extends) and `IMPLEMENTS` (interface implementation) edges |
+| 7 | **Compute graph metrics** | `fan_in`, `fan_out`, `impact_score = fan_in×2 + fan_out`, `is_entry_point`, `is_leaf`, `is_recursive` |
+| 8 | **Gemini enrichment** | Calls Gemini for each node: `summary`, `core_functionality`, `tags`, `layer` (skippable via `skip_enrich=true`) |
+| 9 | **Similarity edges** | Cosine similarity across all embeddings → `SIMILAR_TO` edges (threshold ≥ 0.85, top-5 per node); pushes all nodes + edges to Neo4j |
+| 10 | **Bug annotation** | Runs GraphCodeBERT + Gemini scanner on every Function body; writes `is_buggy`, `severity`, `bug_confidence` back to Neo4j (skippable via `skip_scan=true`) |
 
-#### `api/main.py`
+**Result** (returned on completion):
+```json
+{
+  "nodes_created": 842,
+  "edges_created": 1204,
+  "tags_created": 61,
+  "files_processed": 24,
+  "functions_scanned": 318,
+  "bugs_found": 12
+}
+```
 
-App factory with lifespan management. On startup, calls `initialize_resources()` which connects Neo4j, loads the embedding model, initializes the scanner and the Gemini agent. Configures CORS and mounts all routers.
+**SSE progress events** (streamed to `GET /ingest/progress/{job_id}`):
+```json
+{ "type": "progress", "step": 4, "step_name": "Extracting code graph", "message": "Processed 12/24 files", "progress_pct": 34 }
+```
 
-#### `api/config.py`
+New clients that connect mid-run receive all prior events (full replay), then live updates.
 
-Holds singleton instances: `neo4j_client`, `scanner`, `agent`, `embedding_generator`. Each resource initializes independently — if one fails, others still work and affected endpoints return HTTP 503. This is the **graceful degradation** pattern.
+---
 
-#### `api/dependencies.py`
+## Vulnerability Scanner
 
-FastAPI dependency factories. Each resource (`get_neo4j_client()`, `get_scanner()`, `get_agent()`) raises HTTP 503 if the resource is unavailable, with a descriptive error body explaining which resource failed and why.
+A two-model ensemble combining a fine-tuned code classifier and Gemini LLM analysis with explicit decision logic.
 
-#### `api/models/requests.py`
+### GraphCodeBERT Detector
 
-Pydantic request bodies:
-- `ScanCodeRequest` — raw code + language string
-- `ScanFileRequest` — absolute file path
-- `ScanFolderRequest` — folder path
-- `IngestFolderRequest` — folder path + optional clear flag
-- `ChatRequest` — message + optional session_id
+- **Models**: `2451-22-749-016/graphcodebert-c-bug-detector` (C/C++) and `2451-22-749-016/graphcodebert-java-bug-detector` (Java)
+- **Input**: Function source code (max 512 tokens, `AutoTokenizer` tokenisation)
+- **Output**: `SAFE` or `BUG` + confidence score (0.0–1.0)
+- **Temperature**: 1.5 (mild softmax calibration reduces false positives)
+- **Threshold**: `bug_prob ≥ 0.52` → BUG
 
-#### `api/models/responses.py`
+### LLM Detector (Gemini)
 
-Pydantic response bodies:
-- `BugResult` — function name, severity, confidence, explanation
-- `ScanResponse` — list of BugResult + summary stats
-- `GraphNode` / `GraphEdge` — visualization primitives
-- `IngestJobStatus` — job_id, status, progress, events list
+- **Model**: Configured via `GEMINI_MODEL` env var (default `gemini-2.5-flash`)
+- **Output**: `SAFE`/`BUG` + severity (`CRITICAL` / `HIGH` / `MEDIUM` / `LOW` / `NONE`) + reason
+- **Retries**: 3 attempts with exponential back-off (1.5 s, 3 s, 4.5 s)
+- **Fallback**: Returns `SAFE` / `NONE` if all retries fail
 
-#### `api/routes/scan.py`
+### Decision Logic
 
-Four scan endpoints. All delegate to `scanner.scan_*()` and return `ScanResponse`. The upload endpoint accepts `multipart/form-data`, saves to a temp file, scans, and cleans up.
+```
+GraphCodeBERT confident (≥ 0.80) AND says BUG  →  BUG  (use LLM severity if available)
+GraphCodeBERT unsure  AND  LLM says BUG         →  BUG  (use LLM severity)
+Both say SAFE                                   →  SAFE
+```
 
-#### `api/routes/ingest.py`
+GraphCodeBERT handles high-confidence pattern matching; Gemini provides semantic severity grading.
 
-Ingest endpoints that trigger the 10-step extraction pipeline as a background task. The job is created immediately (returns `job_id`) while the pipeline runs asynchronously. Progress events are pushed to an in-memory job queue and streamed via Server-Sent Events (SSE) at `GET /ingest/progress/{job_id}`. Clients that connect mid-run receive all events from the beginning (replay). The upload endpoint accepts a `.zip` file, extracts it to a temp folder, and ingests.
+### Standalone CLI
 
-#### `api/routes/chat.py`
+```bash
+python main.py --folder ./my-project
+python main.py --file path/to/file.c
+python main.py --code "void foo() { strcpy(buf, src); }" --language c
+```
 
-Chat endpoints backed by `CodebaseAgent`. Sessions are maintained in memory + persisted atomically to `.chat_sessions.json` on every response. The session file is loaded at startup. The `POST /chat/stream` endpoint streams the agent's response token-by-token via SSE using the agent's streaming interface.
+---
 
-#### `api/routes/graph.py`
+## Chat Agent
 
-Read-only graph data endpoints backed by `GraphService`. Used by the frontend for visualization.
+A Gemini ReAct agent that can answer any natural-language question about the ingested codebase by reasoning over 8 graph query tools.
 
-#### `api/services/ingest_service.py`
+### How it works
 
-Orchestrates the 10-step ingestion pipeline with progress callbacks:
+1. User sends a question (e.g. *"Which functions have the highest security risk?"*)
+2. Agent reasons about which tools to call and in what order
+3. Agent calls tools (up to 12 function-call cycles), gets structured data back
+4. Agent synthesises a markdown-formatted answer with code references, call chains, and severity ratings
+5. Response is streamed token-by-token via SSE
 
-| Step | Action |
+### Tools
+
+| Tool | Purpose |
 |---|---|
-| 1 | Connect to Neo4j, create uniqueness constraints |
-| 2 | Load embedding model (all-MiniLM-L6-v2) |
-| 3 | Discover source files (repo_scanner) |
-| 4 | AST extraction (TreeSitter → SymbolExtractor → CodeGraph) |
-| 5 | Call resolution (UnresolvedCall → CALLS edges) |
-| 6 | Inheritance resolution (INHERITS_FROM, IMPLEMENTS edges) |
-| 7 | Metrics computation (fan_in, fan_out, impact_score, entry points) |
-| 8 | Gemini semantic enrichment (summary, tags, layer) |
-| 9 | Similarity edges (cosine sim) + push all to Neo4j |
-| 10 | Bug annotation (GraphCodeBERT + LLM scan → write is_buggy/severity) |
+| `search_by_concept` | Two-phase semantic search: tag match + embedding cosine similarity |
+| `get_node_details` | Full properties of a single function/class/struct by name or UID |
+| `trace_callers` | Who calls this function (upstream, configurable hops) |
+| `trace_callees` | What this function calls (downstream, configurable hops) |
+| `get_impact_analysis` | Blast radius: all callers, callees, metrics, similar functions |
+| `find_vulnerabilities` | All buggy functions sorted by severity + impact score |
+| `run_cypher` | Direct read-only Cypher for complex structural queries (write ops blocked) |
+| *(derived)* | Composed tools: vulnerable paths, entry-point analysis |
 
-Each step calls `progress_callback(step, total, message)` which pushes an SSE event to the job's event queue.
+### Session persistence
 
-#### `api/services/graph_service.py`
+Multi-turn conversations are written to `.chat_sessions.json` after every response (atomic rename, no data loss on restart). Sessions are reloaded on startup. Chat history is included in every subsequent Gemini call for full context continuity.
 
-Runs Cypher queries against Neo4j and returns structured data for the frontend. Returns graph nodes with positions, edges with relationship types, scan results (buggy functions), and aggregate stats (node count, edge count, bug count, entry points).
+### Streaming (POST /chat/stream)
 
----
-
-### `graph_rag/`
-
-Core intelligence layer. Contains all extraction, resolution, enrichment, graph storage, and agent logic.
-
-#### `graph_rag/extraction/`
-
-**`symbol_models.py`** — Domain models:
-- `Node` — single code entity with `uid`, `label`, `name`, `file`, `properties`
-- `Edge` — directed relationship between two node UIDs
-- `CodeGraph` — container: `nodes: List[Node]`, `edges: List[Edge]`, `unresolved_calls: List[UnresolvedCall]`
-- `UnresolvedCall` — a deferred call record `(caller_uid, callee_name, caller_file)` resolved in pass 2
-
-**UID format**: `{relative_file_path}::{qualified_name}` — e.g., `src/auth/AuthService.java::AuthService::login`
-
-**`symbol_index.py`** — Global registry built during pass 1. Maps `name → [uid, ...]` and `qualified_name → uid`. Used by `CallResolver` and `InheritanceResolver` during pass 2 to look up nodes by name across files.
-
-**`symbol_extractor.py`** — Language router. Accepts a file path, detects language by extension, dispatches to `JavaExtractor`, `CExtractor`, or `CppExtractor`. Returns a `CodeGraph`.
-
-**`java_extractor.py`** — Walks Tree-Sitter Java AST. Extracts:
-- `Class`, `Interface`, `Enum` nodes
-- `Function` (method) nodes with bodies
-- `INHERITS_FROM` / `IMPLEMENTS` edges (as UnresolvedCalls for deferred resolution)
-- `HAS_METHOD`, `CONTAINS` structural edges
-- All function call sites → `UnresolvedCall` records
-
-**`c_extractor.py`** — Walks Tree-Sitter C AST. Extracts:
-- `Function` nodes (name, signature, body)
-- `Struct`, `Enum`, `Typedef` nodes
-- `INCLUDES` edges (from `#include` directives)
-- Call sites → `UnresolvedCall` records
-
-**`cpp_extractor.py`** — Walks Tree-Sitter C++ AST. Extracts:
-- `Class`, `Struct`, `Namespace` nodes
-- `Function` nodes with template support
-- Class inheritance via `base_class_clause`
-- Call sites → `UnresolvedCall` records
-
-**`call_resolver.py`** — Pass 2. For each `UnresolvedCall`, calls `symbol_index.resolve_function(callee_name, caller_file)`:
-1. Look for same-file match first
-2. Fall back to unique repo-wide match
-3. Fall back to first match
-4. If still unresolved, create `ExternalFunction` node with `uid = external::{name}`
-Adds `CALLS` edges to the `CodeGraph`.
-
-**`inheritance_resolver.py`** — Pass 2. Resolves class-level inheritance. Maps base class names to known UIDs via `SymbolIndex`, creates `INHERITS_FROM` / `IMPLEMENTS` edges.
+SSE event types:
+```
+{ "type": "thinking" }
+{ "type": "tool_call",   "tool": "find_vulnerabilities", "args": {...} }
+{ "type": "tool_result", "tool": "find_vulnerabilities", "chars": 1842 }
+{ "type": "chunk",       "text": "The three most critical..." }
+{ "type": "done",        "session_id": "uuid", "answer": "..." }
+{ "type": "error",       "message": "..." }
+```
 
 ---
 
-#### `graph_rag/parsing/`
+## Neo4j Graph Schema
 
-**`treesitter_parser.py`** — Thin wrapper around `tree_sitter_languages.get_parser()`. Returns the root AST node for a given source string and language. Supported languages: `c`, `cpp`, `java`.
+### Node Labels
 
----
+All nodes receive a secondary `:CodeEntity` label for fast constraint-indexed MATCH queries.
 
-#### `graph_rag/ingestion/`
-
-**`repo_scanner.py`** — Recursively walks a directory. Skips common non-source directories (`node_modules`, `venv`, `__pycache__`, `.git`, `build`, `dist`, `target`). Returns a list of source file paths with extensions `.c`, `.cpp`, `.h`, `.hpp`, `.java`.
-
----
-
-#### `graph_rag/graph/`
-
-**`neo4j_client.py`** — Neo4j driver wrapper. Manages the driver instance, runs parameterized Cypher queries via `run_query(cypher, params)`, handles connection errors, and exposes `is_connected()`.
-
-**`neo4j_graph_builder.py`** — Inserts a `CodeGraph` into Neo4j:
-1. `create_constraints()` — `CREATE CONSTRAINT IF NOT EXISTS` for `uid` on both the primary label and the `:CodeEntity` secondary label. The secondary label is critical for Aura (hosted Neo4j) where index lookup by primary label alone can fail.
-2. `insert_nodes()` — MERGE on `uid`, SET all properties, add `:CodeEntity` secondary label.
-3. `insert_edges()` — MATCH by `uid` on `:CodeEntity`, MERGE the relationship.
-
----
-
-#### `graph_rag/embedding/`
-
-**`embedding_generator.py`** — Wraps `SentenceTransformer("all-MiniLM-L6-v2")`. Exposes `encode(text) → List[float]` (384-dim). Models are lazy-loaded on first use. Used during enrichment (node embeddings) and at query time (similarity search in agent tools).
-
----
-
-#### `graph_rag/enrichment/`
-
-**`metrics_computer.py`** — Runs Cypher aggregations on Neo4j to compute and write back:
-- `fan_in` = count of incoming CALLS edges
-- `fan_out` = count of outgoing CALLS edges
-- `impact_score` = `fan_in * 2 + fan_out` (higher weight for being called = more downstream impact if changed)
-- `is_entry_point` = `fan_in == 0` and not a constructor/destructor
-
-**`summary_enricher.py`** — For each `Function` and `Class` node (in batches), calls Gemini with the node's source code body. Parses the JSON response to extract:
-- `summary` — 2-3 sentence description
-- `core_functionality` — 1-sentence core purpose
-- `tags` — list of semantic keywords (e.g., `["authentication", "session", "jwt"]`)
-- `layer` — architectural layer (`service`, `repository`, `utility`, `controller`, etc.)
-
-After enrichment, re-encodes `"{name}: {core_functionality}"` as the node's semantic embedding.
-
-**`similarity_enricher.py`** — Loads all node embeddings from Neo4j into memory. Computes pairwise cosine similarity. For pairs exceeding a threshold (default 0.85), creates a `SIMILAR_TO` edge with `similarity_score` property. This powers the `search_by_concept` agent tool.
-
-**`bug_annotator.py`** — Iterates over all `Function` nodes. For each, calls `CodeScanner` (GraphCodeBERT + LLM). Writes `is_buggy`, `severity`, `bug_confidence`, and `bug_explanation` properties back to the node in Neo4j. Nodes already annotated (has `is_buggy` property) are skipped unless `force=True`.
-
----
-
-#### `graph_rag/agent/`
-
-**`codebase_agent.py`** — The conversational AI core. Uses Gemini's function-calling API in a ReAct loop (max 12 turns):
-1. Builds system prompt using `ContextBuilder.build_overview()` — includes total node/edge counts, top entry points, recent vulnerabilities, and reasoning guidelines
-2. Sends user message + history to Gemini
-3. If Gemini returns a `FunctionCall`, dispatches to the appropriate tool
-4. Appends tool result to history
-5. Repeats until Gemini returns a final text response
-6. Returns `(answer: str, updated_history: list)`
-
-**`tools.py`** — 8 graph query tools, each running Cypher queries against Neo4j:
-
-| Tool | Description |
+| Label | Represents |
 |---|---|
-| `search_by_concept` | Find nodes by tags (exact) + semantic embedding similarity |
-| `get_node_details` | Full node properties by name or UID |
-| `trace_callers` | Upstream call graph (who calls this function, N levels deep) |
-| `trace_callees` | Downstream call graph (what this function calls, N levels deep) |
-| `get_impact_analysis` | Blast radius: nodes affected if this function changes |
-| `find_vulnerabilities` | Return all `is_buggy=true` nodes, optionally filtered by severity |
-| `find_vulnerable_paths` | Trace paths from entry points to buggy functions |
-| `run_cypher` | Execute arbitrary read-only Cypher (for advanced queries) |
+| `File` | Source file |
+| `Package` | Java package / C++ namespace |
+| `Namespace` | C++ namespace block |
+| `Import` | import / #include statement |
+| `Class` | Class declaration |
+| `Interface` | Java interface |
+| `Struct` | C / C++ struct |
+| `Enum` | Enum type |
+| `Function` | Function or method |
+| `Field` | Member variable |
+| `Tag` | Semantic tag (e.g. `"authentication"`, `"crypto"`) |
+| `ExternalFunction` | Unresolved external call |
 
-**`tool_registry.py`** — Converts each tool's Python function signature and docstring into a Gemini `FunctionDeclaration` object, enabling Gemini to reason about which tool to call and with what parameters.
-
-**`context_builder.py`** — Runs lightweight Cypher queries to build the agent's system prompt context: node/edge counts by label, top-10 highest-impact entry points, and top-10 most severe buggy functions.
-
----
-
-#### `graph_rag/retrieval/`
-
-**`hybrid_retriever.py`** — Placeholder for a standalone semantic + keyword hybrid retrieval module. Currently the retrieval logic lives in `agent/tools.py`.
-
----
-
-### `vuln_scanner/`
-
-A fully standalone vulnerability scanner that works independently of the graph pipeline. Can be used via CLI or imported as a library.
-
-#### `vuln_scanner/core/scanner.py`
-
-`CodeScanner` — the main orchestrator:
-1. Calls `extract_functions()` to get function code blocks
-2. For each function: runs `GraphCodeBERTDetector.predict()` and `LLMBugDetector.analyze()`
-3. `_decide(graphcodebert_result, llm_result) → ScanResult`:
-   - Both say BUG → BUG (high confidence)
-   - LLM says BUG and severity is CRITICAL or HIGH → BUG (override)
-   - Otherwise → SAFE
-4. Returns `List[ScanResult]`
-
-**Rationale for hybrid decision**: GraphCodeBERT has high false-positive rate on clean code patterns it wasn't trained on. LLM provides semantic understanding but may miss syntax-level patterns. Consensus reduces false positives; LLM override on critical severity prevents false negatives on dangerous vulnerabilities.
-
-#### `vuln_scanner/core/extraction.py`
-
-Two-phase regex-based function extraction (not AST-based, for speed and language-agnostic fallback):
-1. **Phase 1** — Find all function signatures via regex patterns per language
-2. **Phase 2** — Extract the function body by tracking brace depth from the opening `{` until depth returns to 0
-
-Works for C, C++, and Java. Returns `List[FunctionCode(name, code, language)]`.
-
-#### `vuln_scanner/core/language.py`
-
-Maps file extensions to language strings: `.java → java`, `.c → c`, `.cpp/.cc/.cxx → cpp`, `.h/.hpp → cpp`. Returns `None` for unknown extensions.
-
-#### `vuln_scanner/config/settings.py`
-
-`Settings` dataclass loaded from environment variables:
-- `graphcodebert_c_model_path` — path to C vulnerability model
-- `graphcodebert_java_model_path` — path to Java vulnerability model
-- `gcp_project_id`, `gcp_location` — Gemini API settings
-- `gemini_model` — model name (e.g., `gemini-2.5-flash-lite`)
-
-#### `vuln_scanner/detectors/graphcodebert.py`
-
-`GraphCodeBERTDetector` — PyTorch-based classifier:
-- Loads the appropriate model (C or Java) based on language
-- Tokenizes function code using the model's tokenizer
-- Runs forward pass through transformer + classification head
-- Returns `(label: "BUG" | "SAFE", confidence: float)`
-- Models are lazy-loaded on first use per language
-
-Supported languages: `c`, `cpp` (uses C model), `java`. Other languages return `SAFE` with 0.5 confidence.
-
-#### `vuln_scanner/detectors/llm.py`
-
-`LLMBugDetector` — Gemini-based semantic analyzer:
-- Prompts Gemini with the function code + structured output schema
-- Returns `(is_bug: bool, severity: str, confidence: float, explanation: str)`
-- Severity levels: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `NONE`
-- Handles Gemini API errors gracefully (returns SAFE on failure)
-
-#### `vuln_scanner/cli.py`
-
-CLI entry point wrapping `CodeScanner`. Accepts:
-- `--folder PATH` — scan all source files recursively
-- `--file PATH` — scan a single file
-- `--code CODE --language LANG` — scan a raw code string
-- `--json-out PATH` — export results to JSON file
-
-Prints formatted text report to stdout by default.
-
----
-
-### `models/`
-
-Local model storage for GraphCodeBERT classifiers. Each subdirectory is a Hugging Face model checkpoint:
-
-- **`graphcodebert_c_bug_detector/`** — Fine-tuned GraphCodeBERT for C/C++ vulnerability detection (binary classification: BUG / SAFE). Trained on CVE-annotated C/C++ function datasets.
-- **`graphcodebert_java_bug_detector/`** — Fine-tuned GraphCodeBERT for Java vulnerability detection. Trained on Java CVE and bug datasets.
-
-Each model directory contains: `config.json`, `model.safetensors`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `vocab.json`.
-
----
-
-## Data Flow
-
-### Ingest Pipeline
+### Key Node Properties
 
 ```
-User: POST /ingest { "folder": "/path/to/repo" }
-  │
-  ├─ [API] Create IngestJob (job_id) → return immediately
-  │
-  └─ [Background Task] IngestService.run()
-       │
-       ├─ Step 1: Neo4jClient.connect() + create_constraints()
-       ├─ Step 2: EmbeddingGenerator.load()
-       ├─ Step 3: RepoScanner.scan(folder) → [file_paths]
-       │
-       ├─ Step 4: For each file:
-       │     TreeSitterParser.parse(file) → AST
-       │     SymbolExtractor.extract(AST) → CodeGraph fragment
-       │     Merge into global CodeGraph + SymbolIndex
-       │
-       ├─ Step 5: CallResolver.resolve(CodeGraph, SymbolIndex)
-       │     UnresolvedCall("login", "auth.java") → CALLS edge
-       │
-       ├─ Step 6: InheritanceResolver.resolve(CodeGraph, SymbolIndex)
-       │     "BaseService" → INHERITS_FROM edge
-       │
-       ├─ Step 7: MetricsComputer.compute(neo4j)
-       │     → writes fan_in, fan_out, impact_score, is_entry_point
-       │
-       ├─ Step 8: SummaryEnricher.enrich(nodes, gemini)
-       │     code body → Gemini → summary, tags, layer
-       │     → re-encode embedding with "{name}: {core_functionality}"
-       │
-       ├─ Step 9: SimilarityEnricher.add_edges(neo4j)
-       │     cosine(embed_A, embed_B) > 0.85 → SIMILAR_TO edge
-       │     Neo4jGraphBuilder.insert(CodeGraph)
-       │
-       └─ Step 10: BugAnnotator.annotate(all_functions, neo4j)
-              CodeScanner.scan(function_code) per function
-              → write is_buggy, severity, bug_confidence to Neo4j
+uid                  # globally unique ID  (e.g. "src/Auth.java::AuthService::login")
+name                 # simple name
+qualified_name       # full path
+file                 # relative path in repo
+line_start / line_end
+language             # c | cpp | java
+body                 # full source (functions only)
+signature            # with parameter types
+return_type
+visibility           # public | protected | private | default
+is_static / is_virtual / is_abstract / is_override / is_recursive
+
+# Semantic enrichment (Gemini)
+summary              # one-liner
+core_functionality   # 2–3 sentences
+tags                 # ["authentication", "parsing", ...]
+layer                # service | repository | utility | security | ...
+
+# Graph metrics
+fan_in               # number of callers
+fan_out              # number of callees
+impact_score         # fan_in×2 + fan_out
+is_entry_point       # fan_in == 0
+is_leaf              # fan_out == 0
+
+# Vulnerability
+is_buggy             # boolean
+severity             # CRITICAL | HIGH | MEDIUM | LOW | NONE
+bug_confidence       # float 0.0–1.0
+
+# Embeddings
+embedding            # float[384]  (all-MiniLM-L6-v2)
 ```
 
-### Chat / Agent Flow
+### Relationship Types
 
-```
-User: POST /chat { "message": "What are the security-critical functions?", "session_id": "..." }
-  │
-  ├─ [API] Load or create chat session
-  │
-  └─ [CodebaseAgent] chat_with_history(message, history)
-       │
-       ├─ ContextBuilder.build_overview(neo4j)
-       │     → graph stats, top entry points, top vulnerabilities
-       │
-       ├─ Build system prompt with graph context + tool descriptions
-       │
-       └─ Gemini function-calling loop (max 12 turns):
-             │
-             ├─ Gemini decides: call find_vulnerabilities(severity="HIGH")
-             ├─ Tool executes: Cypher → [{name, severity, explanation}, ...]
-             ├─ Append tool result to history
-             │
-             ├─ Gemini decides: call get_impact_analysis(uid="auth.java::AuthService::login")
-             ├─ Tool executes: Cypher → [{affected_node, depth}, ...]
-             ├─ Append tool result to history
-             │
-             └─ Gemini returns final text answer
-                  → Save session → Return to user
-```
-
-### Scan Flow
-
-```
-User: POST /scan/code { "code": "void foo() {...}", "language": "c" }
-  │
-  └─ [CodeScanner]
-       │
-       ├─ extraction.extract_functions(code, language)
-       │     Phase 1: regex match function signatures
-       │     Phase 2: brace-tracking to extract body
-       │     → [FunctionCode("foo", "void foo() {...}")]
-       │
-       ├─ For each function:
-       │     GraphCodeBERTDetector.predict(code, language)
-       │       → ("BUG", 0.87) or ("SAFE", 0.92)
-       │
-       │     LLMBugDetector.analyze(code)
-       │       → (is_bug=True, severity="HIGH", explanation="...")
-       │
-       │     _decide(graphcodebert_result, llm_result)
-       │       → ScanResult(name, is_bug, severity, confidence, explanation)
-       │
-       └─ Return List[ScanResult]
-```
+| Type | Source → Target | Meaning |
+|---|---|---|
+| `DEFINES` | File → Function/Class/Struct | File contains definition |
+| `IMPORTS` | File → Import | Import statement |
+| `INCLUDES` | File → Include | `#include` directive |
+| `HAS_METHOD` | Class → Function | Class declares method |
+| `HAS_FIELD` | Class → Field | Class declares field |
+| `CONTAINS` | Class → any | General containment |
+| `CALLS` | Function → Function | Function call |
+| `INHERITS_FROM` | Class → Class | Class inheritance |
+| `IMPLEMENTS` | Class → Interface | Interface implementation |
+| `TAGGED_WITH` | Function/Class/Struct → Tag | Semantic tag |
+| `SIMILAR_TO` | Function → Function | Cosine similarity ≥ 0.85 |
 
 ---
 
 ## API Reference
 
-### Health
+### Scan — `POST /scan/*`
 
-| Method | Path | Description |
+| Endpoint | Input | Description |
 |---|---|---|
-| `GET` | `/health` | Resource status: Neo4j, scanner, agent (each shows ok/error) |
-| `GET` | `/` | Redirect to `/docs` |
+| `POST /scan/code` | `{ code, language, source? }` | Scan a raw code snippet |
+| `POST /scan/file` | `{ path }` | Scan a file by absolute path |
+| `POST /scan/folder` | `{ path }` | Recursively scan a folder |
+| `POST /scan/upload` | `multipart/form-data` (`.c` `.cpp` `.h` `.java`) | Upload and scan a file |
 
-### Scan
+**Response** (`ScanResponse`):
+```json
+{
+  "summary": { "total_functions": 12, "bugs_found": 3, "critical": 1, "high": 1, "medium": 1, "low": 0 },
+  "results": [
+    {
+      "function_name": "parseInput",
+      "severity": "CRITICAL",
+      "confidence": 0.94,
+      "final_label": "BUG",
+      "function_body": "void parseInput(...) { ... }"
+    }
+  ]
+}
+```
 
-| Method | Path | Body | Description |
-|---|---|---|---|
-| `POST` | `/scan/code` | `{ code, language }` | Scan raw code snippet |
-| `POST` | `/scan/file` | `{ file_path }` | Scan single file by path |
-| `POST` | `/scan/folder` | `{ folder_path }` | Recursively scan a folder |
-| `POST` | `/scan/upload` | `multipart: file` | Upload and scan a single file |
+---
 
-### Ingest
+### Ingest — `POST /ingest*`
 
-| Method | Path | Body | Description |
-|---|---|---|---|
-| `POST` | `/ingest` | `{ folder_path, clear? }` | Start ingestion from server folder |
-| `POST` | `/ingest/upload` | `multipart: file (.zip)` | Upload zip, extract, ingest |
-| `GET` | `/ingest/status/{job_id}` | — | Poll job status as JSON |
-| `GET` | `/ingest/progress/{job_id}` | — | SSE event stream (real-time progress) |
-| `GET` | `/ingest/jobs` | — | List all ingest jobs |
-| `DELETE` | `/ingest/{job_id}` | — | Remove completed job |
-
-### Chat
-
-| Method | Path | Body | Description |
-|---|---|---|---|
-| `POST` | `/chat` | `{ message, session_id? }` | Single-turn Q&A (creates session if needed) |
-| `POST` | `/chat/stream` | `{ message, session_id? }` | Same but streams tokens via SSE |
-| `GET` | `/chat/sessions` | — | List active session IDs + message counts |
-| `DELETE` | `/chat/session/{session_id}` | — | Clear a session's history |
-
-### Graph
-
-| Method | Path | Description |
+| Endpoint | Input | Description |
 |---|---|---|
-| `GET` | `/api/graph` | All nodes + edges for frontend visualization |
-| `GET` | `/api/scan-results` | All buggy functions with severity + explanations |
-| `GET` | `/api/stats` | Aggregate counts (nodes, edges, bugs, entry points) |
-| `GET` | `/api/node/{uid}` | Full details for a single node by UID |
+| `POST /ingest` | `{ folder_path, clear_first?, skip_enrich?, skip_scan? }` | Ingest from server-side folder |
+| `POST /ingest/upload` | `multipart/form-data` (`.zip`, max 512 MB) + query params | Upload and ingest ZIP |
+| `GET /ingest/status/{job_id}` | — | Poll job status (JSON) |
+| `GET /ingest/progress/{job_id}` | — | Stream progress (SSE) |
+| `GET /ingest/jobs` | — | List all jobs |
+| `DELETE /ingest/{job_id}` | — | Delete completed job record |
+
+**Job status values**: `pending` → `running` → `completed` / `failed`
+
+---
+
+### Chat — `POST /chat*`
+
+| Endpoint | Input | Description |
+|---|---|---|
+| `POST /chat` | `{ message, session_id? }` | Single-turn chat (blocking) |
+| `POST /chat/stream` | `{ message, session_id? }` | Streaming chat (SSE) |
+| `GET /chat/sessions` | — | List all sessions |
+| `DELETE /chat/session/{session_id}` | — | Delete a session |
+
+---
+
+### Graph — `GET /api/*`
+
+| Endpoint | Query params | Description |
+|---|---|---|
+| `GET /api/graph` | `node_limit`, `include_labels`, `min_impact_score`, `bugs_only` | Nodes + edges for visualisation |
+| `GET /api/scan-results` | `severity`, `limit` | All vulnerable functions |
+| `GET /api/stats` | — | Aggregate counts (nodes, edges, bugs, files) |
+| `GET /api/node/{uid}` | — | Full details of a single node |
+
+---
+
+### Health — `GET /health`
+
+```json
+{
+  "status": "ok",
+  "neo4j": "ok",
+  "scanner": "ok",
+  "agent": "ok",
+  "version": "1.0.0"
+}
+```
+
+Each resource reports independently. A failed dependency returns `"unavailable"` for that field but does not crash the server — affected endpoints return HTTP 503 with a descriptive error.
+
+---
+
+## Frontend
+
+The React frontend is built with Vite and served directly by FastAPI as a SPA (catch-all route on `/`).
+
+### Pages
+
+**Dashboard** — Upload a `.zip` or enter a folder path, watch real-time ingest progress, see a Neovis.js force-directed graph of the codebase, and review aggregate stats (nodes, edges, bugs, files).
+
+**Scan Results** — Full vulnerability listing from `/api/scan-results`. Filter by severity (CRITICAL / HIGH / MEDIUM / LOW), layer, or language. Click any result to see the full function body, file path, caller chain, and impact score.
+
+**Graph Explorer** — Interactive force-directed graph with click-to-inspect node details, filter by label type, impact score, or bugs-only mode.
+
+**Chat** — Multi-turn streaming chat with the Gemini ReAct agent. Shows live tool calls and results as they happen. Supports multiple named sessions with full history.
+
+### Status Bar
+
+The header shows a live indicator for each backend dependency:
+- 🟢 **Neo4j** — graph database reachable
+- 🟢 **Scanner** — GraphCodeBERT models loaded
+- 🟢 **Agent** — Gemini agent initialised
 
 ---
 
 ## Configuration
 
-All configuration is via environment variables, loaded from `.env` at startup.
+Copy `.env.example` to `.env` and fill in all required values.
 
-### `.env` Template
-
-```ini
-# === Google Vertex AI / Gemini ===
-GOOGLE_APPLICATION_CREDENTIALS=./gcp-credentials.json
-GCP_PROJECT_ID=your-gcp-project-id
-GCP_LOCATION=global
-GEMINI_MODEL=gemini-2.5-flash-lite
-
-# === ML Model Paths ===
-GRAPHCODEBERT_C_MODEL_PATH=./models/graphcodebert_c_bug_detector
-GRAPHCODEBERT_JAVA_MODEL_PATH=./models/graphcodebert_java_bug_detector
-
-# === Neo4j Database ===
-NEO4J_URI=neo4j+s://your-instance.databases.neo4j.io
+```bash
+# ── Neo4j ──────────────────────────────────────────
+NEO4J_URI=bolt://localhost:7687        # bolt:// for local, neo4j+s:// for Aura
 NEO4J_USER=neo4j
-NEO4J_PASSWORD=your-password
+NEO4J_PASSWORD=your_password_here
 
-# === API Server (optional — shown with defaults) ===
-API_HOST=0.0.0.0
-API_PORT=8000
-API_RELOAD=false
-API_WORKERS=1
-LOG_LEVEL=info
+# ── Google Cloud / Gemini ──────────────────────────
+GOOGLE_APPLICATION_CREDENTIALS=./gcp-credentials.json
+GCP_PROJECT_ID=your_gcp_project_id
+GCP_LOCATION=global                    # Vertex AI location
+GEMINI_MODEL=gemini-2.5-flash          # or gemini-2.5-flash-lite-preview
 
-# === CORS (optional — defaults allow localhost:3000 and localhost:5173) ===
-CORS_ORIGINS=http://localhost:3000,http://localhost:5173
+# ── HuggingFace (optional overrides) ──────────────
+# GRAPHCODEBERT_C_MODEL_ID=2451-22-749-016/graphcodebert-c-bug-detector
+# GRAPHCODEBERT_JAVA_MODEL_ID=2451-22-749-016/graphcodebert-java-bug-detector
 
-# === Session persistence (optional) ===
-SESSIONS_FILE=./.chat_sessions.json
+# ── Application ────────────────────────────────────
+PORT=8000
 
-# === Scanner (optional) ===
-DEFAULT_SCAN_FOLDER=./graph_rag/test_repo
+# ── Frontend (Vite, baked at build time) ──────────
+VITE_NEO4J_URI=neo4j://0c64ca5d.databases.neo4j.io   # plain neo4j:// for Neovis.js
+VITE_NEO4J_USER=your_user
+VITE_NEO4J_PASSWORD=your_password
 ```
 
-### Required Credentials
-
-**GCP Service Account (`gcp-credentials.json`)**  
-Must be a valid GCP service account key JSON with Vertex AI / Generative AI API access enabled. Place at the path specified by `GOOGLE_APPLICATION_CREDENTIALS`. Relative paths are resolved from the repo root.
-
-**Neo4j Database**  
-Any Neo4j 5.x instance (Aura cloud or self-hosted). The user must have write access. Constraints are created automatically on first ingest. The URI protocol determines TLS: `neo4j+s://` for encrypted (Aura), `bolt://` for local.
-
-**Pre-trained Models**  
-GraphCodeBERT models must exist at the configured paths. These are Hugging Face model checkpoints. If the paths are wrong, the API starts but scanner endpoints return 503.
+**Required GCP permissions** for the service account:
+- `Vertex AI User` — Gemini API calls (enrichment, agent, LLM scanner)
+- `Secret Manager Secret Accessor` — if credentials are stored in Secret Manager (Cloud Run)
 
 ---
 
-## Installation
+## Local Development
 
 ### Prerequisites
 
-- Python 3.10+
-- Node.js 18+ (for frontend only)
-- A running Neo4j 5.x instance (or a Neo4j Aura free tier account)
-- A GCP project with Vertex AI / Gemini API enabled
+- Python 3.11+
+- Node.js 20+
+- Neo4j instance (local or [Aura free tier](https://neo4j.com/cloud/aura-free/))
+- GCP project with Vertex AI API enabled + service account JSON
 
-### Steps
+### Backend
 
 ```bash
-# 1. Navigate to the project directory
-cd "d:/Vs Codings/codebase-agent"
-
-# 2. Create and activate a Python virtual environment
 python -m venv venv
-source venv/Scripts/activate       # Windows (Git Bash / WSL)
-# OR
-venv\Scripts\activate.bat          # Windows (Command Prompt)
-
-# 3. Install Python dependencies
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 4. Install Node.js dependencies (for frontend)
+cp .env.example .env            # fill in NEO4J_*, GCP_*, GEMINI_MODEL
+uvicorn api.main:app --reload --port 8000
+```
+
+### Frontend (dev server with proxy)
+
+```bash
 npm install
-
-# 5. Configure environment variables
-# Copy the template above into a new .env file and fill in your credentials
-
-# 6. Verify models exist
-ls models/graphcodebert_c_bug_detector/
-ls models/graphcodebert_java_bug_detector/
+npm run dev                     # Vite dev server on http://localhost:5173
 ```
+
+The Vite dev server proxies all `/api`, `/ingest`, `/scan`, `/chat`, `/health` requests to `localhost:8000` — no CORS issues in development.
 
 ---
 
-## Running the System
+## Docker Deployment
 
-### Option A: Full API Server (Recommended)
-
-Starts the FastAPI server with all endpoints available.
+### Running locally with Docker Compose
 
 ```bash
-# Activate virtual environment first
-source venv/Scripts/activate
+# Prerequisites
+cp .env.example .env           # fill in all values
+# place gcp-credentials.json at project root
 
-# Start the server
-python -m api.run
+# Build + start (first run downloads ~1 GB of HF models — ~10 min)
+docker compose up --build
 
-# Or with uvicorn directly
-uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+# Subsequent starts (fast, models cached in named volume)
+docker compose up -d
+
+# Stop (preserves model cache and chat sessions)
+docker compose down
+
+# Stop + wipe everything (forces fresh model download next time)
+docker compose down -v
 ```
 
-- API available at: `http://localhost:8000`
-- Interactive docs (Swagger UI): `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
-- Health check: `http://localhost:8000/health`
+App available at **http://localhost:8080**
 
-Environment overrides for the server:
+### What the Dockerfile does
 
-```bash
-API_PORT=9000 API_RELOAD=true python -m api.run
-```
+The Dockerfile is a two-stage multi-stage build:
+
+**Stage 1** — `node:20-slim` builds the React frontend (`npm run build` → `/frontend/dist`)
+
+**Stage 2** — `python:3.11-slim`:
+1. Installs system deps (`build-essential`, `git`, `curl`, `libgomp1`)
+2. Installs Python deps from `requirements.txt`
+3. Smoke-tests `tree-sitter-languages` (catches binary incompatibility at build time, not at deploy time)
+4. **Pre-downloads HuggingFace models into the image** — `all-MiniLM-L6-v2`, `graphcodebert-c-bug-detector`, `graphcodebert-java-bug-detector` (~1 GB total). This eliminates cold-start download delays on Cloud Run.
+5. Copies backend source and compiled frontend
+6. Exposes port 8080, sets `HEALTHCHECK` (30 s interval, 120 s start period), runs Uvicorn
+
+### Named volumes
+
+| Volume | Contents | Cleared by |
+|---|---|---|
+| `hf_model_cache` | HuggingFace model weights (~1 GB) | `docker compose down -v` |
+| `sessions_data` | Chat session history | `docker compose down -v` |
 
 ---
 
-### Option B: Standalone Vulnerability Scanner (CLI)
+## Cloud Run Deployment
 
-Scan code without Neo4j or the agent. Only requires GCP credentials and the model files.
+### One-time setup
 
-```bash
-# Scan a folder recursively
-python main.py --folder /path/to/your/repo
+```powershell
+# Authenticate Docker to Artifact Registry
+gcloud auth configure-docker us-central1-docker.pkg.dev
 
-# Scan a single file
-python main.py --file /path/to/AuthService.java
+# Create the registry repository (first time only)
+gcloud artifacts repositories create codebase-agent `
+  --repository-format=docker `
+  --location=us-central1 `
+  --project=YOUR_PROJECT_ID
 
-# Scan a raw code snippet
-python main.py --code "void transfer(int amount) { balance -= amount; }" --language c
+# Store GCP credentials as a secret (never bake into image)
+gcloud secrets create gcp-credentials `
+  --project=YOUR_PROJECT_ID `
+  --data-file=./gcp-credentials.json
 
-# Export results to JSON
-python main.py --folder /path/to/repo --json-out results.json
+# Grant Cloud Run's service account access to read the secret
+$PROJECT_NUMBER = gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)'
+gcloud secrets add-iam-policy-binding gcp-credentials `
+  --project=YOUR_PROJECT_ID `
+  --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" `
+  --role="roles/secretmanager.secretAccessor"
 ```
 
----
+### Build and push
 
-### Option C: Run Extraction Pipeline Directly (Testing / Development)
+```powershell
+# Build locally
+docker build -t codebase-agent-app:latest .
 
-Runs the full 10-step ingestion pipeline as a standalone script, bypassing the API.
+# Tag and push
+docker tag codebase-agent-app:latest `
+  us-central1-docker.pkg.dev/YOUR_PROJECT_ID/codebase-agent/app:v1
 
-```bash
-cd graph_rag
-
-# Use the built-in test_repo
-python run_extraction.py
-
-# Use a custom repository
-python run_extraction.py /path/to/your/repo
-
-# Clear existing Neo4j data and re-ingest
-python run_extraction.py /path/to/your/repo --clear
-
-# Skip Gemini enrichment (faster, no API calls)
-python run_extraction.py /path/to/your/repo --no-enrich
+docker push `
+  us-central1-docker.pkg.dev/YOUR_PROJECT_ID/codebase-agent/app:v1
 ```
 
----
+### Deploy
 
-### Typical End-to-End Workflow
-
+```powershell
+gcloud run deploy codebase-agent `
+  --image=us-central1-docker.pkg.dev/YOUR_PROJECT_ID/codebase-agent/app:v1 `
+  --region=us-central1 `
+  --project=YOUR_PROJECT_ID `
+  --platform=managed `
+  --allow-unauthenticated `
+  --port=8080 `
+  --memory=4Gi `
+  --cpu=2 `
+  --timeout=300 `
+  --concurrency=1 `
+  --set-secrets=/secrets/gcp-credentials.json=gcp-credentials:latest `
+  --set-env-vars="GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp-credentials.json" `
+  --set-env-vars="GCP_PROJECT_ID=YOUR_PROJECT_ID" `
+  --set-env-vars="GCP_LOCATION=global" `
+  --set-env-vars="GEMINI_MODEL=gemini-2.5-flash" `
+  --set-env-vars="NEO4J_URI=neo4j+s://YOUR_AURA_ID.databases.neo4j.io" `
+  --set-env-vars="NEO4J_USER=YOUR_USER" `
+  --set-env-vars="NEO4J_PASSWORD=YOUR_PASSWORD" `
+  --set-env-vars="HF_HOME=/app/.hf_cache"
 ```
-1. Start API server
-   python -m api.run
 
-2. Ingest your codebase
-   POST http://localhost:8000/ingest
-   Body: { "folder_path": "/absolute/path/to/repo", "clear": true }
-   → Returns: { "job_id": "abc123" }
+> **Important**: Mount the credentials at `/secrets/gcp-credentials.json`, **not** `/app/gcp-credentials.json`. Cloud Run mounts the secret volume at the parent directory — mounting inside `/app` would shadow the entire application directory.
 
-3. Watch ingestion progress (Server-Sent Events)
-   GET http://localhost:8000/ingest/progress/abc123
-   → Streams step-by-step progress events
+> **`--concurrency=1`**: PyTorch models are not thread-safe for concurrent CPU inference. Keep at 1 unless you add request queuing.
 
-4. Query with natural language
-   POST http://localhost:8000/chat
-   Body: { "message": "Which functions are most critical to security?" }
-   → Returns: AI answer + session_id for follow-up questions
+### Key differences from docker-compose
 
-5. Visualize the graph
-   GET http://localhost:8000/api/graph
-   → Returns nodes + edges for your frontend visualization
-
-6. View vulnerability report
-   GET http://localhost:8000/api/scan-results
-   → Returns all detected vulnerabilities with severity and explanations
-```
+| Concern | docker-compose | Cloud Run |
+|---|---|---|
+| GCP credentials | File volume mount | Secret Manager → `/secrets/` |
+| HF model cache | Named Docker volume (persists) | Baked into image (no runtime download) |
+| Chat sessions | Named Docker volume (persists) | Lost on container restart (stateless) |
+| Port | 8080 | Set by Cloud Run via `PORT` env var |
 
 ---
 
 ## Common Issues
 
-### Nodes inserted but no edges appear in Neo4j
+### `ModuleNotFoundError: No module named 'api'` on Cloud Run
 
-**Cause**: Label-based index lookup fails on Neo4j Aura for cross-file relationships.  
-**Fix**: Already handled — all nodes receive a secondary `:CodeEntity` label, and constraints are created on both the primary label and `:CodeEntity`. All `MATCH` clauses in `neo4j_graph_builder.py` use `:CodeEntity` as the anchor.
+The secret volume was mounted inside `/app`, shadowing the entire application directory. Always use `--set-secrets=/secrets/gcp-credentials.json=...` (outside `/app`).
 
-### GraphCodeBERT model not found / scanner returns 503
+### Container fails startup probe / `No module named 'api'` locally
 
-**Cause**: Model paths in `.env` don't point to existing directories.  
-**Check**: Verify `./models/graphcodebert_c_bug_detector/config.json` and `./models/graphcodebert_java_bug_detector/config.json` exist.  
-**Fix**: Set correct absolute paths in `GRAPHCODEBERT_C_MODEL_PATH` and `GRAPHCODEBERT_JAVA_MODEL_PATH`.
+Run `docker run --rm your-image ls /app/` to verify `api/` is present. If missing, check `.dockerignore` — `api/` should not be excluded.
 
-### Gemini API authentication error
+### 0 nodes / 0 edges after ZIP upload
 
-**Cause**: Invalid or missing GCP credentials.  
-**Check**: Confirm `gcp-credentials.json` exists at the path in `GOOGLE_APPLICATION_CREDENTIALS`. Confirm the service account has Vertex AI API access enabled in GCP Console.  
-**Fix**: Re-download the service account key from GCP IAM and update the file.
+Likely causes:
+1. **Embedding failure silently skipped files** — the `_embed()` method in each extractor wraps `generate()` in a try/except so embedding errors no longer abort extraction
+2. **`clear_first=true` wiped the database** — the frontend uses `clear_first=false` by default; re-ingest to repopulate
+3. **Neo4j idle connection dropped** — the pipeline re-verifies connectivity before the insert step and reconnects if needed
 
-### Ingest fails on large codebases
+### Chat agent shows red status (503)
 
-**Cause**: Gemini API rate limits or memory exhaustion during enrichment step.  
-**Fix 1**: Use `--no-enrich` flag (run_extraction.py) or temporarily set `GEMINI_MODEL` to a faster model.  
-**Fix 2**: Ingest subsystems separately (split the folder).  
-**Fix 3**: Add `time.sleep()` between enrichment batches (see `summary_enricher.py`).
+The agent creates its own Neo4j connection at startup. If this fails, the agent is marked unavailable but other endpoints (scan, ingest, graph) still work. Check:
+1. `NEO4J_URI` is reachable from the container
+2. `GOOGLE_APPLICATION_CREDENTIALS` points to a valid, existing file
+3. `GCP_PROJECT_ID` is set and the Vertex AI API is enabled in that project
 
-### Chat agent gives generic answers / doesn't use graph tools
+### `tree-sitter-languages` binary incompatible
 
-**Cause**: Neo4j is empty (ingest hasn't run) or `ContextBuilder` returns empty graph overview.  
-**Check**: `GET /api/stats` — if all counts are 0, ingest hasn't completed.  
-**Fix**: Run the ingest pipeline first, then retry the chat.
+The Dockerfile smoke-tests the grammars at build time. If the build fails here, the `tree-sitter-languages` wheel for this Python version / platform is incompatible. Pin to a different version in `requirements.txt`.
 
-### Port already in use
+### Models downloading on every Cloud Run cold start
 
-```bash
-# Find and kill the process using port 8000
-netstat -ano | findstr :8000
-taskkill /PID <pid> /F
-```
+Ensure the image was built with the model pre-download step (added to the Dockerfile after the tree-sitter smoke test). The `HF_HOME=/app/.hf_cache` env var must match at both build time and runtime so the pre-cached models are found.
+
+### Gemini model not found
+
+Verify `GEMINI_MODEL` is a valid model ID available in your GCP project and region. Use `gemini-2.5-flash` as a reliable default.
